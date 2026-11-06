@@ -1,0 +1,325 @@
+# configuration/admin.py
+from django.contrib import admin
+from django.utils.html import format_html
+from django.urls import reverse, path
+from django.contrib import messages
+from django.shortcuts import redirect
+from django.http import FileResponse
+from simple_history.admin import SimpleHistoryAdmin
+from unfold.admin import ModelAdmin as UnfoldModelAdmin
+from .services import BackupService
+from .models import Currency, CompanyBankAccount, Company, Backup, PaymentMethod
+import os
+from django_erp.configuration.mixins import CompanyFilterMixin
+from django import forms
+from unfold.widgets import UnfoldAdminSelectWidget
+
+
+@admin.register(Company)
+class CompanyAdmin(UnfoldModelAdmin):
+    """Admin de compañías - Ahora gestiona múltiples compañías"""
+    
+    list_display = ['code', 'name', 'rif', 'is_main', 'parent', 'is_active']
+    list_filter = ['is_main', 'is_active']
+    search_fields = ['code', 'name', 'rif']
+    change_list_template = "admin/configuration/company_changelist.html"
+    
+    fieldsets = (
+        ('Identificación', {
+            'fields': ('code', 'name', 'trade_name', 'rif', 'parent')
+        }),
+        ('Contacto', {
+            'fields': ('address', 'phone', 'email', 'website', 'logo')
+        }),
+        ('Configuración', {
+            'fields': ('default_currency', 'invoice_prefix', 'control_number_required')
+        }),
+        ('Estado', {
+            'fields': ('is_main', 'is_active')
+        }),
+        ('Configuración de Ventas', {
+            'fields': ('commission_enabled', 'require_salesperson_pin', 'commission_by_service_only')
+        }),
+    )
+    
+    readonly_fields = ['created_at', 'updated_at']
+    
+    
+    @admin.display(description='Logo')
+    def logo_preview(self, obj):
+        if obj.logo:
+            return format_html(
+                '<img src="{}" width="50" height="50" style="object-fit: contain;" />',
+                obj.logo.url
+            )
+        return "Sin logo"
+    
+    def has_delete_permission(self, request, obj=None):
+        if obj and obj.is_active:
+            return False
+        return super().has_delete_permission(request, obj)
+
+    # ✅ NUEVO: el RIF se vuelve readonly si es sucursal
+    def get_readonly_fields(self, request, obj=None):
+        readonly = list(self.readonly_fields)
+        if obj and obj.parent:
+            readonly.append('rif')
+        return readonly
+    
+    # ✅ NUEVO: help text dinámico
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+
+        # ✅ Solo modificar el help_text si el campo está en el form
+        if obj and obj.parent and 'rif' in form.base_fields:
+            form.base_fields['rif'].help_text = (
+                f"El RIF se hereda automáticamente de la compañía matriz "
+                f"({obj.parent.rif}). No se puede modificar."
+            )
+        return form
+    
+    def save_model(self, request, obj, form, change):
+        """Al guardar, verificar que la compañía principal tenga su propio código"""
+        if obj.is_main and not obj.code:
+            obj.code = 'MAIN'
+        super().save_model(request, obj, form, change)
+    
+    def get_queryset(self, request):
+        """Los superusuarios ven todas, los demás solo las que tienen asignadas"""
+        qs = super().get_queryset(request)
+        if request.user.is_superuser:
+            return qs
+        return qs.filter(users=request.user)
+
+
+@admin.register(Backup)
+class BackupAdmin(CompanyFilterMixin, UnfoldModelAdmin, SimpleHistoryAdmin):
+    """
+    Admin de respaldos.
+    
+    ✅ El botón "+" crea un respaldo directamente (sin formulario).
+    """
+    
+    # ❌ Ya no usa change_list_template custom
+    # change_list_template = "admin/configuration/backup_changelist.html"
+    
+    list_display = ['name', 'file_size_display', 'status_badge', 'created_at', 'user']
+    list_filter = ['status', 'created_at']
+    search_fields = ['name', 'note']
+    readonly_fields = ['created_at', 'completed_at', 'user', 'name', 'file_path', 'status', 'note']
+    
+    fieldsets = (
+        ('Información', {
+            'fields': ('name', 'status')
+        }),
+        ('Fechas', {
+            'fields': ('created_at', 'completed_at')
+        }),
+        ('Usuario', {
+            'fields': ('user', 'note')
+        }),
+    )
+    
+    # ============================================================
+    # ✅ PERMISOS: habilitar el botón "+"
+    # ============================================================
+    
+    def has_add_permission(self, request):
+        """✅ Habilitar el botón '+' (solo para superuser)."""
+        return request.user.is_superuser
+    
+    def has_change_permission(self, request, obj=None):
+        """✅ No se puede editar un respaldo (solo ver)."""
+        return False
+    
+    def has_delete_permission(self, request, obj=None):
+        """❌ No se puede borrar un respaldo."""
+        return False
+    
+    # ============================================================
+    # ✅ ADD_VIEW: en lugar de formulario, crea el respaldo y redirige
+    # ============================================================
+    
+    def add_view(self, request, form_url='', extra_context=None):
+        """
+        Sobrescribe la vista de agregar.
+        
+        En lugar de mostrar un formulario, ejecuta la creación del respaldo
+        y redirige a la lista con un mensaje de éxito o error.
+        """
+        # ✅ Solo POST ejecuta la creación
+        # Si es GET, redirigimos inmediatamente (sin mostrar formulario)
+        if request.method == 'GET':
+            # Ejecutar la creación directamente
+            return self._create_backup(request)
+        
+        # Si es POST (raro), también la ejecutamos
+        return self._create_backup(request)
+    
+    def _create_backup(self, request):
+        """Lógica compartida para crear el respaldo."""
+        try:
+            backup = BackupService.create_backup(user=request.user)
+            
+            # ✅ Mensaje de éxito con la ruta
+            file_path = backup.file_path
+            file_name = os.path.basename(file_path)
+            size_display = backup.file_size_display
+            
+            self.message_user(
+                request,
+                f'✅ Respaldo creado exitosamente: {file_name} ({size_display})',
+                messages.SUCCESS,
+            )
+            
+            # ℹ️ Mensaje adicional con la ubicación
+            self.message_user(
+                request,
+                f'📁 Guardado en: {file_path}',
+                messages.INFO,
+            )
+            
+        except Exception as e:
+            self.message_user(
+                request,
+                f'❌ Error al crear respaldo: {str(e)}',
+                messages.ERROR,
+            )
+        
+        # ✅ Redirigir SIEMPRE a la lista
+        return redirect('admin:configuration_backup_changelist')
+    
+    # ============================================================
+    # DISPLAYS
+    # ============================================================
+    
+    @admin.display(description='Tamaño')
+    def file_size_display(self, obj):
+        return obj.file_size_display
+    
+    @admin.display(description='Estado')
+    def status_badge(self, obj):
+        colors = {
+            'PENDING': ('#f59e0b', 'Pendiente'),      # ámbar
+            'PROCESSING': ('#3b82f6', 'Procesando'),  # azul
+            'COMPLETED': ('#10b981', 'Completado'),   # verde
+            'FAILED': ('#ef4444', 'Fallido'),         # rojo
+        }
+        color, label = colors.get(obj.status, ('#6b7280', obj.status))
+        return format_html(
+            '<span style="'
+                'display: inline-block;'
+                'background: {};'
+                'color: white;'
+                'padding: 4px 12px;'
+                'border-radius: 9999px;'
+                'font-size: 11px;'
+                'font-weight: 600;'
+                'letter-spacing: 0.025em;'
+                'text-transform: uppercase;'
+                'white-space: nowrap;'
+            '">{}</span>',
+            color,
+            label
+        )
+    
+    def get_actions(self, request):
+        return {}
+
+
+@admin.register(Currency)
+class CurrencyAdmin(UnfoldModelAdmin, SimpleHistoryAdmin):
+    """✅ Admin de monedas GLOBALES - No usa CompanyFilterMixin"""
+    
+    list_display = ['code', 'name', 'symbol', 'is_base_badge', 'is_active']
+    list_filter = ['is_active', 'is_base']
+    search_fields = ['code', 'name']
+    
+    fieldsets = (
+        ('Información', {
+            'fields': ('code', 'name', 'symbol', 'decimal_places')
+        }),
+        ('Configuración', {
+            'fields': ('is_base', 'is_active'),
+            'description': 'Solo una moneda puede ser la base del sistema'
+        }),
+    )
+    
+    @admin.display(description='Moneda Base')
+    def is_base_badge(self, obj):
+        if obj.is_base:
+            return "✅ Base"
+        return "-"
+
+
+
+@admin.register(PaymentMethod)
+class PaymentMethodAdmin(CompanyFilterMixin, UnfoldModelAdmin, SimpleHistoryAdmin):
+    """✅ Admin de métodos de pago POR COMPAÑÍA"""
+    
+    list_display = ['name', 'code', 'is_active_badge', 'requires_approval_badge', 'icon', 'default_currency', 'company']
+    list_filter = ['is_active', 'requires_approval', 'company']
+    search_fields = ['name', 'code']
+    autocomplete_fields = ['default_currency']
+    
+    fieldsets = (
+        ('Información', {
+            'fields': ('name', 'code', 'description')
+        }),
+        ('Configuración', {
+            'fields': ('is_active', 'requires_approval', 'icon', 'default_currency', 'company')
+        }),
+    )
+    
+    @admin.display(description='Activo')
+    def is_active_badge(self, obj):
+        if obj.is_active:
+            return "✅ Activo"
+        return "❌ Inactivo"
+    
+    @admin.display(description='Requiere Aprobación')
+    def requires_approval_badge(self, obj):
+        if obj.requires_approval:
+            return "⚠️ Sí"
+        return "No"
+
+
+@admin.register(CompanyBankAccount)
+class CompanyBankAccountAdmin(CompanyFilterMixin, UnfoldModelAdmin, SimpleHistoryAdmin):
+    """Admin de cuentas bancarias POR COMPAÑÍA"""
+    
+    list_display = [
+        'bank_name', 
+        'account_number', 
+        'account_holder', 
+        'currency', 
+        'is_default_badge', 
+        'is_active',
+        'company'
+    ]
+    list_filter = ['currency', 'is_active', 'is_default', 'company']
+    search_fields = ['bank_name', 'account_number', 'account_holder']
+    autocomplete_fields = ['currency']
+    
+    fieldsets = (
+        ('Datos de la Cuenta', {
+            'fields': ('bank_name', 'account_type', 'account_number', 'account_holder')
+        }),
+        ('Moneda', {
+            'fields': ('currency',)
+        }),
+        ('Configuración', {
+            'fields': ('is_default', 'is_active', 'company')
+        }),
+    )
+    
+    @admin.display(description='Por Defecto')
+    def is_default_badge(self, obj):
+        if obj.is_default:
+            return "⭐ Sí"
+        return "-"
+    
+    def save_model(self, request, obj, form, change):
+        if obj.is_default:
+            CompanyBankAccount.objects.filter(is_default=True).exclude(pk=obj.pk).update(is_default=False)
+        super().save_model(request, obj, form, change)

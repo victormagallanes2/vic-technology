@@ -1,0 +1,61 @@
+# users/models.py
+from django.contrib.auth.models import AbstractUser
+from django.db import models
+
+
+class User(AbstractUser):
+    """Modelo de usuario personalizado"""
+    
+    email = models.EmailField(unique=True, verbose_name="Correo electrónico")
+    companies = models.ManyToManyField(
+        'configuration.Company',
+        related_name='users',
+        blank=True,
+        verbose_name="Compañías asignadas",
+        help_text="Compañías a las que el usuario tiene acceso"
+    )
+
+
+    preferred_company = models.ForeignKey(
+        'configuration.Company',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='users_who_prefer_this',
+        verbose_name="Compañía preferida",
+        help_text=(
+            "Compañía que el usuario verá por defecto al iniciar sesión. "
+            "Se actualiza automáticamente cada vez que cambia de compañía."
+        )
+    )
+
+    is_employee = models.BooleanField(
+        default=False,
+        verbose_name="¿Es empleado?",
+        help_text="Indica si el usuario es un empleado de la empresa"
+    )
+
+
+    is_staff = models.BooleanField(
+        default=True,
+        verbose_name="¿Acceso al admin?",
+        help_text=(
+            "Marcar para permitir el acceso a la interfaz del ERP "
+            "(/admin/). Desmarcar solo para usuarios que NO deben "
+            "entrar al sistema (ej: portales externos, cuentas API)."
+        ),
+    )
+
+    class Meta:
+        verbose_name = "Usuario"
+        verbose_name_plural = "Usuarios"
+    
+    def __str__(self):
+        return self.username
+    
+    def get_available_companies(self):
+        """Obtener todas las compañías disponibles para el usuario"""
+        if self.is_superuser:
+            return Company.get_active_companies()
+        return self.companies.filter(is_active=True)
+
